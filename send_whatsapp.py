@@ -1,140 +1,138 @@
-import sys
-import pandas as pd 
-import pywhatkit as kit 
-import time 
-import re 
-import pyautogui 
+#!/usr/bin/env python3
+import sys, os, time, re, json, csv
 from datetime import datetime
 
-# Accept command-line args from PHP
-if len(sys.argv) < 7:
-    print("Usage: python send_whatsapp.py <csv_file> <country_code> <delay> <image_path> <status_log_file> <message_template>")
+# third-party libs
+try:
+    import pandas as pd
+    import pywhatkit as kit
+    import pyautogui
+    import requests
+except ImportError:
+    print("Missing dependencies. Run: pip3 install pandas pywhatkit pyautogui requests")
     sys.exit(1)
 
-CSV_FILE = sys.argv[1]
-COUNTRY_CODE = sys.argv[2]
-DELAY_BETWEEN_MESSAGES = int(sys.argv[3])
-IMAGE_PATH = sys.argv[4] if sys.argv[4] != "" else None
-STATUS_LOG_FILE = sys.argv[5]
-MESSAGE_TEMPLATE = sys.argv[6]
+if len(sys.argv) < 8:
+    print("Usage: python send_whatsapp.py <csv_file> <country_code> <delay> <image_path> <status_log_file> <message_template> <username>")
+    sys.exit(1)
 
+CSV_FILE, COUNTRY_CODE, DELAY_BETWEEN_MESSAGES, IMAGE_PATH, STATUS_LOG_FILE, MESSAGE_TEMPLATE, USERNAME = sys.argv[1:8]
+DELAY_BETWEEN_MESSAGES = int(DELAY_BETWEEN_MESSAGES)
+IMAGE_PATH = IMAGE_PATH if IMAGE_PATH else None
 
+ROOT_DIR = os.path.dirname(__file__)
+PROGRESS_FILE = os.path.join(ROOT_DIR, "progress.json")
+STOP_FILE = os.path.join(ROOT_DIR, "stop.flag")
+PAUSE_FILE = os.path.join(ROOT_DIR, "pause.flag")
+LOG_API = "http://localhost/log_message.php"  # Adjust domain if needed
 
+def write_progress(sent, total, logs, done=False):
+    data = {"sent": sent, "total": total, "done": done, "log": logs[-200:]}
+    try:
+        with open(PROGRESS_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("Failed writing progress.json:", e)
 
-def clean_phone_number(number, country_code="+91"):
-    """Clean and format the phone number to WhatsApp international format."""
-    number = str(number).strip()
-    number = re.sub(r'\D', '', number)  # Remove everything except digits
-
+def clean_phone(number, country_code="+91"):
+    number = str(number or "").strip()
+    number = re.sub(r'\D', '', number)
     if not number:
         return None
-
-    if not number.startswith(country_code.replace("+", "")):
-        number = number.lstrip("0")
-        number = country_code + number
-    else:
-        number = "+" + number
-
-    return number
-
+    if not number.startswith("+"):
+        number = country_code + number.lstrip("0")
+    return "+" + number if not number.startswith("+") else number
 
 def close_browser_tab():
-    """Close the Chrome/WhatsApp Web tab."""
     try:
-        time.sleep(5)  # allow WhatsApp Web to finish sending
+        time.sleep(3)
         pyautogui.hotkey("command", "w")  # macOS
-        pyautogui.hotkey("ctrl", "w")     # Windows/Linux
-        print("🪟 Closed WhatsApp tab.")
-    except Exception as e:
-        print(f"⚠️ Could not close tab: {e}")
+        pyautogui.hotkey("ctrl", "w")     # fallback
+    except:
+        pass
 
-
-def send_whatsapp_message(phone, message, image_path=None):
-    """Send a WhatsApp message with image and handle exceptions properly."""
+def send_whatsapp(phone, message, image_path=None):
     try:
-        if image_path:
-            kit.sendwhats_image(
-                receiver=phone,
-                img_path=image_path,
-                caption=message,
-                wait_time=15
-            )
+        if image_path and os.path.exists(image_path):
+            kit.sendwhats_image(receiver=phone, img_path=image_path, caption=message, wait_time=15)
         else:
-            kit.sendwhatmsg_instantly(
-                phone_no=phone,
-                message=message,
-                wait_time=10,
-                tab_close=True
-            )
-
-        print(f"✅ Message sent successfully to {phone}")
-        time.sleep(5)
+            kit.sendwhatmsg_instantly(phone_no=phone, message=message, wait_time=10, tab_close=True)
+        time.sleep(4)
         close_browser_tab()
-        return "Success", None
-
+        return "Success", ""
     except Exception as e:
-        print(f"❌ Failed to send message to {phone}: {e}")
         close_browser_tab()
         return "Failed", str(e)
 
-
-def log_status(results):
-    """Write results to CSV log file (append if already exists)."""
-    df_log = pd.DataFrame(results)
+def log_to_php(payload):
     try:
-        existing = pd.read_csv(STATUS_LOG_FILE)
-        df_log = pd.concat([existing, df_log], ignore_index=True)
-    except FileNotFoundError:
+        requests.post(LOG_API, json=payload, timeout=8)
+    except:
         pass
 
-    df_log.to_csv(STATUS_LOG_FILE, index=False)
-    print(f"\n🧾 Log saved/updated at '{STATUS_LOG_FILE}'")
-
-
-def main():
+# --- Load CSV ---
+try:
     df = pd.read_csv(CSV_FILE)
+except Exception as e:
+    write_progress(0, 0, [f"❌ Failed to read CSV: {e}"], done=True)
+    sys.exit(1)
 
-    if 'contact' not in df.columns:
-        raise ValueError("CSV must contain a 'contact' column")
-    if 'name' not in df.columns:
-        df['name'] = ""  # fallback if missing
+if 'contact' not in df.columns:
+    write_progress(0, 0, ["❌ CSV must contain 'contact' column"], done=True)
+    sys.exit(1)
+if 'name' not in df.columns:
+    df['name'] = ""
 
-    results = []
+total = len(df)
+sent = 0
+logs = []
 
-    for i, row in enumerate(df.itertuples(), 1):
-        raw_contact = getattr(row, "contact")
-        name = getattr(row, "name", "")
-        phone = clean_phone_number(raw_contact, COUNTRY_CODE)
+write_progress(sent, total, logs)
 
-        if not phone:
-            print(f"⚠️ Skipping invalid number: {raw_contact}")
-            results.append({
-                "name": name,
-                "contact": raw_contact,
-                "status": "Invalid",
-                "error": "Invalid number format",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-            continue
+# --- Sending loop ---
+for idx, row in enumerate(df.itertuples(), start=1):
+    if os.path.exists(STOP_FILE):
+        logs.append("🛑 Stop detected. Exiting.")
+        write_progress(sent, total, logs, done=True)
+        try: os.remove(STOP_FILE)
+        except: pass
+        break
 
-        message = MESSAGE_TEMPLATE.format(name=name.strip() or "there")
+    while os.path.exists(PAUSE_FILE):
+        logs.append("⏸ Paused. Waiting...")
+        write_progress(sent, total, logs)
+        time.sleep(3)
 
-        print(f"\n[{i}/{len(df)}] Sending to {name} ({phone})...")
-        status, error = send_whatsapp_message(phone, message, IMAGE_PATH)
+    phone = clean_phone(getattr(row, "contact", ""), COUNTRY_CODE)
+    name = getattr(row, "name", "").strip() or "there"
 
-        results.append({
-            "name": name,
-            "contact": phone,
-            "status": status,
-            "error": error if error else "",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
+    if not phone:
+        logs.append(f"⚠️ Skipping invalid number: {getattr(row,'contact','')}")
+        write_progress(sent, total, logs)
+        log_to_php({"username": USERNAME, "name": name, "contact": getattr(row,'contact',''), "status":"Invalid", "error":"Invalid number"})
+        continue
 
-        time.sleep(DELAY_BETWEEN_MESSAGES)
+    message = MESSAGE_TEMPLATE.replace("{name}", name)
+    logs.append(f"[{idx}/{total}] Sending to {name} ({phone})...")
+    write_progress(sent, total, logs)
 
-    log_status(results)
-    print("\n🎉 All messages processed! Check status_log.csv for details.")
+    status, error = send_whatsapp(phone, message, IMAGE_PATH)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    write_progress(sent, total, logs)
+    log_to_php({"username": USERNAME, "name": name, "contact": phone, "status": status, "error": error})
 
+    if status == "Success": sent += 1
+    logs.append(f"{'✅' if status=='Success' else '❌'} {name} ({phone}) - {status}")
+    write_progress(sent, total, logs)
 
-if __name__ == "__main__":
-    main()
+    # Save to local CSV log
+    try:
+        with open(STATUS_LOG_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([USERNAME, name, phone, status, error, timestamp])
+    except: pass
+
+    time.sleep(DELAY_BETWEEN_MESSAGES)
+
+logs.append("🎉 All messages processed.")
+write_progress(sent, total, logs, done=True)
